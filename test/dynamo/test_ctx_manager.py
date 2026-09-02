@@ -90,6 +90,71 @@ def customized_ctx_manager_with_graph_break(mode):
 
 
 class CtxManagerTests(torch._dynamo.test_case.TestCase):
+    def _run_leaking_pair(self, leak_fn):
+        # Drives a real torch._dynamo.test_case.TestCase instance's
+        # setUp/tearDown around leak_fn, then reads global autocast state
+        # right after tearDown -- exactly what a subsequent test would see
+        # as its ambient state if tearDown failed to restore it. Defined
+        # locally (not at module scope) so the test loader doesn't discover
+        # and run it as its own standalone test case.
+        class _Probe(torch._dynamo.test_case.TestCase):
+            def runTest(self):
+                pass
+
+        probe = _Probe()
+        probe.setUp()
+        try:
+            leak_fn()
+        finally:
+            probe.tearDown()
+
+        return {
+            "enabled": torch.is_autocast_enabled("cpu"),
+            "dtype": torch.get_autocast_dtype("cpu"),
+            "cache_enabled": torch.is_autocast_cache_enabled(),
+            "nesting": torch._dynamo.test_case._autocast_nesting(),
+        }
+
+    def test_teardown_restores_autocast_enabled(self):
+        baseline = torch.is_autocast_enabled("cpu")
+
+        def leak():
+            torch.set_autocast_enabled("cpu", not baseline)
+
+        seen = self._run_leaking_pair(leak)
+        self.assertEqual(seen["enabled"], baseline)
+
+    def test_teardown_restores_autocast_dtype(self):
+        baseline = torch.get_autocast_dtype("cpu")
+        other = torch.float16 if baseline != torch.float16 else torch.bfloat16
+
+        def leak():
+            torch.set_autocast_dtype("cpu", other)
+
+        seen = self._run_leaking_pair(leak)
+        self.assertEqual(seen["dtype"], baseline)
+
+    def test_teardown_restores_autocast_cache_enabled(self):
+        baseline = torch.is_autocast_cache_enabled()
+
+        def leak():
+            torch.set_autocast_cache_enabled(not baseline)
+
+        seen = self._run_leaking_pair(leak)
+        self.assertEqual(seen["cache_enabled"], baseline)
+
+    def test_teardown_restores_autocast_nesting(self):
+        baseline = torch._dynamo.test_case._autocast_nesting()
+
+        def leak():
+            # Unmatched increment: simulates a test that entered an
+            # autocast region and never exited it (e.g. via an early
+            # return or an exception swallowed before __exit__ ran).
+            torch.autocast_increment_nesting()
+
+        seen = self._run_leaking_pair(leak)
+        self.assertEqual(seen["nesting"], baseline)
+
     def test_no_grad(self):
         def fn1(a, b):
             x = a + 1

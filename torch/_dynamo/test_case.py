@@ -37,6 +37,69 @@ from . import config, utils
 log = logging.getLogger(__name__)
 
 
+def _autocast_nesting() -> int:
+    # There is no direct getter for the autocast nesting counter, only
+    # autocast_increment_nesting()/autocast_decrement_nesting(), so read it
+    # via a no-net-effect increment+decrement pair.
+    n = torch.autocast_increment_nesting()
+    torch.autocast_decrement_nesting()
+    return n - 1
+
+
+def _restore_autocast_nesting(target: int) -> None:
+    delta = _autocast_nesting() - target
+    for _ in range(delta):
+        torch.autocast_decrement_nesting()
+    for _ in range(-delta):
+        torch.autocast_increment_nesting()
+
+
+# Single source of truth for which autocast globals get snapshotted/restored
+# around each test, mirroring common_utils.py's _fp32_precision_flag_specs.
+# Scoped to device "cpu" only: cache_enabled is a single global flag
+# regardless of device, so it's fully covered; enabled/dtype are per-device,
+# but no test in this suite mutates them for another device outside of the
+# self-restoring `with torch.autocast(...)` context manager.
+def _autocast_state_specs():
+    return (
+        (
+            "autocast enabled state",
+            lambda: torch.is_autocast_enabled("cpu"),
+            lambda v: torch.set_autocast_enabled("cpu", v),
+        ),
+        (
+            "autocast dtype",
+            lambda: torch.get_autocast_dtype("cpu"),
+            lambda v: torch.set_autocast_dtype("cpu", v),
+        ),
+        (
+            "autocast cache enabled state",
+            torch.is_autocast_cache_enabled,
+            torch.set_autocast_cache_enabled,
+        ),
+        ("autocast nesting depth", _autocast_nesting, _restore_autocast_nesting),
+    )
+
+
+def _snapshot_autocast_state():
+    return tuple(get() for _, get, _ in _autocast_state_specs())
+
+
+def _restore_autocast_state(snapshot) -> None:
+    specs = _autocast_state_specs()
+    if not isinstance(snapshot, tuple) or len(snapshot) != len(specs):
+        # Catches accidental shadowing of self._prior_autocast_state by a
+        # subclass (e.g. assigning a scalar); without this check zip() would
+        # silently iterate over the wrong sequence.
+        raise TypeError(
+            f"autocast state snapshot must be a {len(specs)}-tuple, "
+            f"got {type(snapshot).__name__} of length "
+            f"{len(snapshot) if hasattr(snapshot, '__len__') else 'unknown'}"
+        )
+    for (_, _, set_), value in zip(specs, snapshot):
+        set_(value)
+
+
 def run_tests(needs: str | tuple[str, ...] = ()) -> None:
     from torch.testing._internal.common_utils import run_tests
 
@@ -88,6 +151,7 @@ class TestCase(TorchTestCase):
 
     def setUp(self) -> None:
         self._prior_is_grad_enabled = torch.is_grad_enabled()
+        self._prior_autocast_state = _snapshot_autocast_state()
         self._prior_nested_graph_breaks = config.nested_graph_breaks
         config.nested_graph_breaks = True
         super().setUp()
@@ -101,11 +165,25 @@ class TestCase(TorchTestCase):
             log.debug("%s %s", k, v.most_common())
         utils.counters.clear()
         torch._C._autograd._saved_tensors_hooks_enable()
-        super().tearDown()
-        if self._prior_is_grad_enabled is not torch.is_grad_enabled():
-            log.warning("Running test changed grad mode")
-            torch.set_grad_enabled(self._prior_is_grad_enabled)
-        config.nested_graph_breaks = self._prior_nested_graph_breaks
+        try:
+            super().tearDown()
+            if self._prior_is_grad_enabled is not torch.is_grad_enabled():
+                log.warning("Running test changed grad mode")
+                torch.set_grad_enabled(self._prior_is_grad_enabled)
+            current_autocast_state = _snapshot_autocast_state()
+            if current_autocast_state != self._prior_autocast_state:
+                specs = _autocast_state_specs()
+                changed = ", ".join(
+                    label
+                    for (label, _, _), prior, current in zip(
+                        specs, self._prior_autocast_state, current_autocast_state
+                    )
+                    if prior != current
+                )
+                log.warning("Running test changed %s", changed)
+                _restore_autocast_state(self._prior_autocast_state)
+        finally:
+            config.nested_graph_breaks = self._prior_nested_graph_breaks
 
     def before_cuda_memory_leak_check(self) -> None:
         super().before_cuda_memory_leak_check()
