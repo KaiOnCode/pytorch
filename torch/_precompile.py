@@ -1780,6 +1780,7 @@ def _build_multigraph_python_source(
     package_entry: object = None,
     entry_binding: dict[str, Any] | None = None,
     rendered: Mapping[str, str] | None = None,
+    refused: Mapping[str, str] | None = None,
 ) -> str:
     """Render a multi-graph capture as ``python_code``.
 
@@ -1912,11 +1913,11 @@ def _build_multigraph_python_source(
     parts.append("")
     # A compiled subgraph is Inductor output, which HAS a source form -- unlike
     # the guard trees and bytecode above. Emit that source where the backend can
-    # produce it, and fall back to the pickle only for the rest (eager graphs, a
-    # training graph, anything the lowering refused). The blocks are spliced
-    # sequentially into this module's namespace and each one's ``call`` is
-    # snapshotted immediately, because every block rebinds ``call`` / ``Runner``
-    # / ``async_compile``; the snapshot is what makes the shadowing harmless.
+    # produce it, and fall back to the pickle only for the rest (eager graphs,
+    # anything the lowering refused). The blocks are spliced sequentially into
+    # this module's namespace and each one's ``call`` is snapshotted
+    # immediately, because every block rebinds ``call`` / ``Runner`` /
+    # ``async_compile``; the snapshot is what makes the shadowing harmless.
     rendered = dict(rendered or {})
     parts.append("# " + "=" * 70)
     if rendered:
@@ -1928,6 +1929,10 @@ def _build_multigraph_python_source(
             )
     else:
         parts.append("# 3. Compiled subgraphs -- OPAQUE")
+    # Why a subgraph stayed pickled, so the fallback is visible in the artifact
+    # itself and not only in a warning at capture time.
+    for backend_id, reason in (refused or {}).items():
+        parts.append(f"#    {backend_id} stays pickled: {reason}")
     parts.append("#")
     parts.append("# base64(pickle) of the backend artifacts the frames call by name.")
     parts.append("# " + "=" * 70)
@@ -2142,6 +2147,7 @@ def _build_multigraph_artifact(
     backend: str,
     entry_fn: object = None,
     rendered: Mapping[str, str] | None = None,
+    refused: Mapping[str, str] | None = None,
 ) -> tuple[str, bytes]:
     """``(python_code, cache)`` for a multi-graph capture.
 
@@ -2176,6 +2182,7 @@ def _build_multigraph_artifact(
         package_entry,
         _entry_binding(entry_fn),
         dict(rendered or {}),
+        refused,
     )
     inductor_bundle = None
     if backend != "eager":
@@ -2927,10 +2934,9 @@ class _PrecompileApi:
                     example_inputs=example_inputs,
                     invariants=invariants,
                     training=bool(training),
-                    # Only what rendered_backends renders: not eager fx graphs,
-                    # and not training graphs (compile_to_python would drop the
-                    # backward).
-                    keep_graphs=backend != "eager" and not training,
+                    # Only what rendered_backends renders: an eager "backend" is
+                    # an fx graph with no source to emit.
+                    keep_graphs=backend != "eager",
                     prune_invariant_guards=True,
                 )
             )
