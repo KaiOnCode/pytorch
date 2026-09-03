@@ -204,6 +204,7 @@ from .user_defined import (
     UserDefinedDictVariable,
     UserDefinedExceptionClassVariable,
     UserDefinedExceptionObjectVariable,
+    UserDefinedFrozensetVariable,
     UserDefinedListVariable,
     UserDefinedObjectVariable,
     UserDefinedSetVariable,
