@@ -74,10 +74,10 @@ from ..utils import (
     get_fake_value,
     is_tensor_getset_descriptor,
     istype,
+    list_methods,
     numpy_operator_wrapper,
     proxy_args_kwargs,
     raise_args_mismatch,
-    str_methods,
     tensortype_to_dtype,
     unpack_iterable,
 )
@@ -86,6 +86,7 @@ from .base import (
     GetSet,
     Member,
     Method,
+    NO_SUCH_SUBOBJ,
     ValueMutationNew,
     VariableTracker,
 )
@@ -184,6 +185,7 @@ _BUILTIN_CONSTANT_FOLDABLE_METHODS: dict[type, frozenset[str]] = {
     float: frozenset({"fromhex", "hex"}),
 }
 if sys.version_info >= (3, 14):
+    _BUILTIN_CONSTANT_FOLDABLE_METHODS[float] |= frozenset({"from_number"})
     _BUILTIN_CONSTANT_FOLDABLE_METHODS[complex] = frozenset({"from_number"})
 
 
@@ -1888,15 +1890,23 @@ class BuiltinVariable(BaseBuiltinVariable):
             # object.__init__ is a no-op
             return variables.ConstantVariable.create(None)
 
-        if self.fn in (set, frozenset, list, tuple):
+        if self.fn in (
+            bool,
+            bytes,
+            complex,
+            float,
+            frozenset,
+            int,
+            str,
+            set,
+            tuple,
+        ) and isinstance(
+            inspect.getattr_static(self.fn, name, None),
+            (types.WrapperDescriptorType, types.MethodDescriptorType),
+        ):
             if isinstance(args[0], variables.UserDefinedObjectVariable):
-                if args[0]._base_vt is None:
-                    raise AssertionError(
-                        "UserDefinedObjectVariable._base_vt must not be None"
-                    )
-                return args[0]._base_vt.call_method(tx, name, args[1:], kwargs)
-            else:
-                return args[0].call_method(tx, name, args[1:], kwargs)
+                return args[0].call_base_method(tx, name, args[1:], kwargs)
+            return args[0].call_method(tx, name, args[1:], kwargs)
 
         if (
             name in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
@@ -1914,20 +1924,6 @@ class BuiltinVariable(BaseBuiltinVariable):
             if isinstance(lval, self.fn):
                 return ConstantVariable.create(
                     getattr(self.fn, name)(lval, args[1].as_python_constant())
-                )
-
-        if self.fn is str and len(args) >= 1:
-            resolved_fn = getattr(self.fn, name, None)
-            if resolved_fn in str_methods:
-                # Only delegate to ConstantVariable, not other types that happen to be constants
-                if isinstance(args[0], ConstantVariable):
-                    return args[0].call_method(tx, name, args[1:], kwargs)
-
-        if self.fn is float and len(args) >= 1:
-            # Only delegate to ConstantVariable, not other types that happen to be constants
-            if isinstance(args[0], ConstantVariable):
-                return VariableTracker.build(
-                    tx, getattr(float, name)(args[0].as_python_constant())
                 )
 
         if name == "__len__" and len(args) == 1 and not kwargs:
@@ -1969,11 +1965,26 @@ class BuiltinVariable(BaseBuiltinVariable):
 
         if name == "__hash__" and len(args) == 1 and not kwargs:
             arg = args[0]
+            arg_type = maybe_get_python_type(arg)
             if (
-                isinstance(arg, variables.UserDefinedConstantVariable)
-                and arg._base_vt is not None
+                isinstance(self.fn, type)
+                and arg_type is not None
+                and issubclass(arg_type, self.fn)
             ):
-                return generic_hash(tx, arg._base_vt)
+                if arg_type is self.fn:
+                    return generic_hash(tx, arg)
+                # Explicit base-class unbound call, e.g. int.__hash__(self)
+                # called from inside a subclass's own __hash__ override.
+                # generic_hash(tx, arg) would dispatch polymorphically via
+                # arg's most-derived type and re-enter the override --
+                # infinite recursion if the override itself calls
+                # base.__hash__(self) (as e.g. HashCountingInt does). Call
+                # the base type's real slot directly on the underlying
+                # object instead, mirroring CPython's wrapperdescr_call.
+                real_value = arg.get_real_python_backed_value()
+                if real_value is not NO_SUCH_SUBOBJ:
+                    # pyrefly: ignore[bad-argument-count]
+                    return ConstantVariable.create(self.fn.__hash__(real_value))
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -3286,14 +3297,16 @@ class DictBuiltinVariable(BaseBuiltinVariable):
 
         resolved_fn = getattr(dict, name, None)
         if resolved_fn is not None and resolved_fn in dict_methods:
-            if isinstance(args[0], variables.UserDefinedDictVariable):
-                if args[0]._base_vt is None:
-                    raise AssertionError(
-                        "UserDefinedDictVariable._base_vt must not be None for dict method dispatch"
-                    )
-                return args[0]._base_vt.call_method(tx, name, args[1:], kwargs)
-            elif isinstance(args[0], ConstDictVariable):
-                return args[0].call_method(tx, name, args[1:], kwargs)
+            obj = args[0]
+            if isinstance(obj, UserDefinedObjectVariable):
+                # dict.name(obj) explicitly calls the real dict method,
+                # bypassing any subclass override of `name` -- obj.call_method
+                # would dispatch polymorphically and re-enter the override
+                # (infinite recursion if the override itself calls
+                # dict.name(self), e.g. `def items(self): return
+                # reversed(dict.items(self))`).
+                return obj.call_base_method(tx, name, args[1:], kwargs)
+            return obj.call_method(tx, name, args[1:], kwargs)
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -3899,6 +3912,13 @@ class ListBuiltinVariable(BaseBuiltinVariable):
                     [],
                     tx=tx,
                 )
+
+        resolved_fn = getattr(list, name, None)
+        if resolved_fn is not None and resolved_fn in list_methods:
+            obj = args[0]
+            if isinstance(obj, UserDefinedObjectVariable):
+                return obj.call_base_method(tx, name, args[1:], kwargs)
+            return obj.call_method(tx, name, args[1:], kwargs)
 
         return super().call_method(tx, name, args, kwargs)
 

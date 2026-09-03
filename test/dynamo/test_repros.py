@@ -8594,6 +8594,27 @@ SavedForBackwardsAOTOutput(idx=5)""",
         )
         self.assertEqual(result.dtype, torch.float32)
 
+    def test_call_with_kwarg(self):
+        # Python <= 3.12 compiles a call with a literal keyword argument to
+        # KW_NAMES (pushes the arg names tuple into co_consts) followed by
+        # CALL, rather than 3.13+'s CALL_KW (which pushes the names tuple
+        # onto the stack). The KW_NAMES handler stashes the names via
+        # `self.kw_names = ConstantVariable.create(value=kw_names)`, but
+        # ConstantVariable.create() routes tuple values to TupleVariable, not
+        # ConstantVariable -- so `self.kw_names` ends up a TupleVariable, and
+        # CALL's `self.kw_names.value` (only ConstantVariable has `.value`)
+        # raises AttributeError. Every compiled call with a literal keyword
+        # argument hits this on 3.11/3.12.
+        def helper(a, b=1):
+            return a + b
+
+        def fn(x):
+            return helper(x, b=2)
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(3)
+        self.assertEqual(opt_fn(x), fn(x))
+
     def test_empty_out_shape_mismatch_dynamic(self):
         def f(size, out):
             return torch.empty(size, out=out, dtype=torch.float32)
@@ -8878,6 +8899,70 @@ SavedForBackwardsAOTOutput(idx=5)""",
         grid2 = torch.rand(2, 11, 7, 2) * 2 - 1
         self.assertEqual(opt_fn(inp2, grid2), fn(inp2, grid2))
         self.assertEqual(cnt.frame_count, 1)
+
+    def test_unbound_builtin_method_calls_fullgraph(self):
+        def fn(x):
+            a = [1, 2, 3]
+            list.append(a, 9)
+            return (
+                x + 1,
+                list.__len__(a),
+                a,
+                list.__eq__(a, [1, 2, 3, 9]),
+                list.__ne__(a, [1, 2, 3, 9]),
+                list.__lt__(a, [1, 2, 3, 9, 10]),
+                list.__le__(a, [1, 2, 3, 9]),
+                list.__gt__(a, [1, 2, 3]),
+                list.__ge__(a, [1, 2, 3, 9]),
+                int.__add__(1, 2),
+                int.bit_length(5),
+                bool.__and__(True, False),
+                float.__add__(1.0, 2.0),
+                complex.__add__(1 + 1j, 2 + 2j),
+                bytes.decode(b"abc"),
+            )
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(2)
+        expected = fn(x)
+        actual = opt_fn(x)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1:], expected[1:])
+
+    def test_unbound_method_call_user_defined_class_variable(self):
+        def fn(x):
+            dq = collections.deque([1, 2, 3])
+            collections.deque.append(dq, 9)
+            return x + 1, list(dq)
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(2)
+        expected = fn(x)
+        actual = opt_fn(x)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1])
+
+    def test_unbound_method_call_user_defined_object_subclass(self):
+        class MyList(list):
+            pass
+
+        def fn(x):
+            a = MyList([1, 2, 3])
+            list.append(a, 9)
+            return x + 1, list.__len__(a), list(a)
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(2)
+        expected = fn(x)
+        actual = opt_fn(x)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1:], expected[1:])
+
+    def test_unbound_classmethod_descriptor_not_split(self):
+        def fn():
+            return dict.fromkeys([1, 2, 3]), int.from_bytes(b"\x01\x00", "little")
+
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(), fn())
 
 
 class ReproTestsDevice(torch._dynamo.test_case.TestCase):
