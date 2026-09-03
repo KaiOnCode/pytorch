@@ -36,6 +36,7 @@ from torch.testing._internal.common_cuda import (
     TEST_CUDA,
     TEST_CUDNN,
 )
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_quantization import (
     skipIfNoFBGEMM,
     skipIfNoONEDNN,
@@ -53,6 +54,7 @@ from torch.testing._internal.common_quantized import (
     supported_qengines,
 )
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     IS_ARM64,
     IS_FBCODE,
     IS_MACOS,
@@ -374,6 +376,12 @@ def _test_qlinear_fp8_fast_path_helper(error_conn=None):
 class TestQuantizedOps(TestCase):
 
     """Helper function to test quantized activation functions."""
+    # Tagged CPU even though test_qrelu, test_qgelu and test_adaptive_avg_pool also
+    # loop over cuda when TEST_CUDA: they are qint-dtype tests, so the bulk of the
+    # class is QuantizedCPU-only and splitting three device loops out would mean
+    # duplicating their whole bodies.
+    hw_classification = HardwareClassification.CPU
+
     def _test_activation_function(self, X, fn_name, test_configs):
         r"""
             When writing a unit test for the activation function,
@@ -1134,77 +1142,6 @@ class TestQuantizedOps(TestCase):
             self.assertEqual(qCrelu_hat, qCrelu_out_hat,
                              msg="AddReLU.out failed")
 
-    """Tests the correctness of the cudnn add and add_relu op
-    (Similar to test_qadd_relu_different_qparams, will probably merge in the future)"""
-    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
-    @unittest.skipIf(not SM80OrLater, "requires sm80 or later.")
-    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
-    @unittest.skip("not currently working and feature isn't used")
-    def test_qadd_relu_cudnn(self):
-        dtype = torch.qint8
-        add_relu = torch.ops.quantized.add_relu
-        add = torch.ops.quantized.add
-
-        A = torch.arange(-128, 130, dtype=torch.float).to(torch.device("cuda"))
-        B = torch.arange(-128, 130, dtype=torch.float).to(torch.device("cuda"))
-        scale_A = 2.5
-        scale_B = 6.3
-        scale_C = 12.9
-        zero_point = 0
-        qA = torch.quantize_per_tensor(A, scale=scale_A, zero_point=zero_point,
-                                       dtype=dtype)
-        qB = torch.quantize_per_tensor(B, scale=scale_B, zero_point=zero_point,
-                                       dtype=dtype)
-        # Add ground truth
-        C = (qA.dequantize() + qB.dequantize()).to(device="cpu").numpy()
-        qC = _quantize(C, scale_C, zero_point, dtype=np_dtype[dtype])
-        qC_hat = add(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
-        np.testing.assert_equal(qC, qC_hat.int_repr(),
-                                "Quantized addition failed.")
-
-        # Add + ReLU ground truth
-        Crelu = C.copy()
-        Crelu[C < 0] = 0
-        qCrelu = _quantize(Crelu, scale_C, zero_point, dtype=np_dtype[dtype])
-        qCrelu_hat = add_relu(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
-        np.testing.assert_equal(qCrelu, qCrelu_hat.int_repr(),
-                                "Quantized addition with ReLU failed.")
-
-    """Tests the correctness of the cudnn add and add_relu op for nhwc format"""
-    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
-    @unittest.skipIf(not SM80OrLater, "requires sm80 or later.")
-    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
-    @unittest.skip("not currently working and feature isn't used")
-    def test_qadd_relu_cudnn_nhwc(self):
-        dtype = torch.qint8
-        add_relu = torch.ops.quantized.add_relu
-        add = torch.ops.quantized.add
-
-        A = torch.rand(16, 8, 4, 12).to(device="cuda")
-        B = torch.rand(16, 8, 4, 12).to(device="cuda")
-        scale_A = 2.5
-        scale_B = 6.3
-        scale_C = 12.9
-        zero_point = 0
-        qA = torch.quantize_per_tensor(A, scale=scale_A, zero_point=zero_point,
-                                       dtype=dtype)
-        qB = torch.quantize_per_tensor(B, scale=scale_B, zero_point=zero_point,
-                                       dtype=dtype)
-        # Add ground truth
-        C = (qA.dequantize() + qB.dequantize()).to(device="cpu").numpy()
-        qC = _quantize(C, scale_C, zero_point, dtype=np_dtype[dtype])
-        qC_hat = add(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
-        np.testing.assert_equal(qC, qC_hat.int_repr(),
-                                "Quantized addition failed.")
-
-        # Add + ReLU ground truth
-        Crelu = C.copy()
-        Crelu[C < 0] = 0
-        qCrelu = _quantize(Crelu, scale_C, zero_point, dtype=np_dtype[dtype])
-        qCrelu_hat = add_relu(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
-        np.testing.assert_equal(qCrelu, qCrelu_hat.int_repr(),
-                                "Quantized addition with ReLU failed.")
-
     """Tests the correctness of the add and add_relu op."""
     def test_qadd_relu_different_qparams(self):
         for dtype in [torch.quint8, torch.qint8, torch.qint32]:
@@ -1611,50 +1548,6 @@ class TestQuantizedOps(TestCase):
         self.assertEqual(a_ref, a_hat.dequantize(),
                          msg="ops.quantized.max_pool1d results are off")
 
-    # TODO: merge this test with test_max_pool2d
-    """Tests 2D cudnn max pool operation on quantized tensors."""
-    @given(X=hu.tensor(shapes=hu.array_shapes(min_dims=3, max_dims=4,
-                                              min_side=1, max_side=10),
-                       # cudnn's support for quantized pooling is limited to
-                       # int8 currently
-                       qparams=hu.qparams(dtypes=[torch.qint8])),
-           kernel=st.sampled_from((3, 5, 7)),
-           stride=st.sampled_from((None, 1, 2)),
-           # currently there is no support for dilation for cudnn
-           # pooling
-           dilation=st.integers(1, 1),
-           padding=st.integers(0, 2),
-           ceil_mode=st.booleans())
-    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
-    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
-    def test_max_pool2d_cudnn(self, X, kernel, stride, dilation, padding, ceil_mode):
-        X, (scale, zero_point, torch_type) = X
-        assume(kernel // 2 >= padding)  # Kernel cannot be overhanging!
-        iH, iW = X.shape[-2:]
-        oH = pool_output_shape(iH, kernel, padding, stride, dilation, ceil_mode)
-        assume(oH > 0)
-        oW = pool_output_shape(iW, kernel, padding, stride, dilation, ceil_mode)
-        assume(oW > 0)
-
-        a = torch.from_numpy(X).to(device="cuda")
-        a_pool = torch.nn.functional.max_pool2d(a, kernel_size=kernel,
-                                                stride=stride,
-                                                padding=padding, dilation=dilation,
-                                                ceil_mode=ceil_mode)
-        a_ref = torch.quantize_per_tensor(a_pool, scale=scale,
-                                          zero_point=zero_point, dtype=torch_type)
-        a_ref = a_ref.dequantize()
-        qa = torch.quantize_per_tensor(a, scale=scale, zero_point=zero_point,
-                                       dtype=torch_type)
-
-        # Test the ops.quantized separately, because None is not treated.
-        a_hat = torch.ops.quantized.max_pool2d(
-            qa, kernel_size=_pair(kernel),
-            stride=_pair(kernel if stride is None else stride),
-            padding=_pair(padding), dilation=_pair(dilation), ceil_mode=ceil_mode)
-        self.assertEqual(a_ref, a_hat.dequantize(),
-                         msg="ops.quantized.max_pool2d results are off")
-
     """Tests 2D max pool operation on quantized tensors."""
     @given(X=hu.tensor(shapes=hu.array_shapes(min_dims=3, max_dims=4,
                                               min_side=1, max_side=10),
@@ -1703,34 +1596,6 @@ class TestQuantizedOps(TestCase):
             padding=_pair(padding), dilation=_pair(dilation), ceil_mode=ceil_mode)
         self.assertEqual(a_ref, a_hat.dequantize(),
                          msg="ops.quantized.max_pool2d results are off")
-
-
-    @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
-    def test_max_pool2d_pt2e(self):
-        kernel_list = [2, 3]
-        stride_list = [1, 2]
-        padding_list = [0, 2]
-        dilation_list = [1, 2]
-        ceil_mode_list = [False, True]
-        channels_last_input = [False, True]
-        options = itertools.product(kernel_list, stride_list, padding_list, dilation_list, ceil_mode_list, channels_last_input)
-        for kernel, stride, padding, dilation, ceil_mode, channels_last in options:
-            if padding >= (kernel // 2):
-                # Continue with invalid input
-                continue
-            input = torch.randint(0, 8, (1, 3, 8, 8), dtype=torch.uint8)
-            if channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-            a_pool = torch.nn.functional.max_pool2d(input.to(torch.float32), kernel_size=kernel,
-                                                    stride=stride, padding=padding, dilation=dilation,
-                                                    ceil_mode=ceil_mode).to(torch.uint8)
-            a_hat = torch.ops.quantized.max_pool2d(input, kernel_size=_pair(kernel),
-                                                   stride=_pair(stride), padding=_pair(padding),
-                                                   dilation=_pair(dilation), ceil_mode=ceil_mode)
-            self.assertEqual(input.is_contiguous(), a_hat.is_contiguous(),
-                             msg="ops.quantized.max_pool2d input output diff memory format")
-            self.assertEqual(a_pool, a_hat,
-                             msg="ops.quantized.max_pool2d results are off")
 
 
     """Tests 3D max pool operation on quantized tensors."""
@@ -3492,8 +3357,173 @@ class TestQuantizedOps(TestCase):
             self.assertEqual(y, y_ref, msg=lambda msg: f"{msg}\n{y} vs {y_ref}")
 
 
+class TestQuantizedOpsCUDNN(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    """Tests the correctness of the cudnn add and add_relu op
+    (Similar to test_qadd_relu_different_qparams, will probably merge in the future)"""
+    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
+    @unittest.skipIf(not SM80OrLater, "requires sm80 or later.")
+    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
+    @unittest.skip("not currently working and feature isn't used")
+    def test_qadd_relu_cudnn(self):
+        dtype = torch.qint8
+        add_relu = torch.ops.quantized.add_relu
+        add = torch.ops.quantized.add
+
+        A = torch.arange(-128, 130, dtype=torch.float).to(torch.device("cuda"))
+        B = torch.arange(-128, 130, dtype=torch.float).to(torch.device("cuda"))
+        scale_A = 2.5
+        scale_B = 6.3
+        scale_C = 12.9
+        zero_point = 0
+        qA = torch.quantize_per_tensor(A, scale=scale_A, zero_point=zero_point,
+                                       dtype=dtype)
+        qB = torch.quantize_per_tensor(B, scale=scale_B, zero_point=zero_point,
+                                       dtype=dtype)
+        # Add ground truth
+        C = (qA.dequantize() + qB.dequantize()).to(device="cpu").numpy()
+        qC = _quantize(C, scale_C, zero_point, dtype=np_dtype[dtype])
+        qC_hat = add(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
+        np.testing.assert_equal(qC, qC_hat.int_repr(),
+                                "Quantized addition failed.")
+
+        # Add + ReLU ground truth
+        Crelu = C.copy()
+        Crelu[C < 0] = 0
+        qCrelu = _quantize(Crelu, scale_C, zero_point, dtype=np_dtype[dtype])
+        qCrelu_hat = add_relu(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
+        np.testing.assert_equal(qCrelu, qCrelu_hat.int_repr(),
+                                "Quantized addition with ReLU failed.")
+
+    """Tests the correctness of the cudnn add and add_relu op for nhwc format"""
+    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
+    @unittest.skipIf(not SM80OrLater, "requires sm80 or later.")
+    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
+    @unittest.skip("not currently working and feature isn't used")
+    def test_qadd_relu_cudnn_nhwc(self):
+        dtype = torch.qint8
+        add_relu = torch.ops.quantized.add_relu
+        add = torch.ops.quantized.add
+
+        A = torch.rand(16, 8, 4, 12).to(device="cuda")
+        B = torch.rand(16, 8, 4, 12).to(device="cuda")
+        scale_A = 2.5
+        scale_B = 6.3
+        scale_C = 12.9
+        zero_point = 0
+        qA = torch.quantize_per_tensor(A, scale=scale_A, zero_point=zero_point,
+                                       dtype=dtype)
+        qB = torch.quantize_per_tensor(B, scale=scale_B, zero_point=zero_point,
+                                       dtype=dtype)
+        # Add ground truth
+        C = (qA.dequantize() + qB.dequantize()).to(device="cpu").numpy()
+        qC = _quantize(C, scale_C, zero_point, dtype=np_dtype[dtype])
+        qC_hat = add(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
+        np.testing.assert_equal(qC, qC_hat.int_repr(),
+                                "Quantized addition failed.")
+
+        # Add + ReLU ground truth
+        Crelu = C.copy()
+        Crelu[C < 0] = 0
+        qCrelu = _quantize(Crelu, scale_C, zero_point, dtype=np_dtype[dtype])
+        qCrelu_hat = add_relu(qA, qB, scale=scale_C, zero_point=zero_point).to(device="cpu")
+        np.testing.assert_equal(qCrelu, qCrelu_hat.int_repr(),
+                                "Quantized addition with ReLU failed.")
+
+    # TODO: merge this test with test_max_pool2d
+    """Tests 2D cudnn max pool operation on quantized tensors."""
+    @given(X=hu.tensor(shapes=hu.array_shapes(min_dims=3, max_dims=4,
+                                              min_side=1, max_side=10),
+                       # cudnn's support for quantized pooling is limited to
+                       # int8 currently
+                       qparams=hu.qparams(dtypes=[torch.qint8])),
+           kernel=st.sampled_from((3, 5, 7)),
+           stride=st.sampled_from((None, 1, 2)),
+           # currently there is no support for dilation for cudnn
+           # pooling
+           dilation=st.integers(1, 1),
+           padding=st.integers(0, 2),
+           ceil_mode=st.booleans())
+    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
+    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
+    def test_max_pool2d_cudnn(self, X, kernel, stride, dilation, padding, ceil_mode):
+        X, (scale, zero_point, torch_type) = X
+        assume(kernel // 2 >= padding)  # Kernel cannot be overhanging!
+        iH, iW = X.shape[-2:]
+        oH = pool_output_shape(iH, kernel, padding, stride, dilation, ceil_mode)
+        assume(oH > 0)
+        oW = pool_output_shape(iW, kernel, padding, stride, dilation, ceil_mode)
+        assume(oW > 0)
+
+        a = torch.from_numpy(X).to(device="cuda")
+        a_pool = torch.nn.functional.max_pool2d(a, kernel_size=kernel,
+                                                stride=stride,
+                                                padding=padding, dilation=dilation,
+                                                ceil_mode=ceil_mode)
+        a_ref = torch.quantize_per_tensor(a_pool, scale=scale,
+                                          zero_point=zero_point, dtype=torch_type)
+        a_ref = a_ref.dequantize()
+        qa = torch.quantize_per_tensor(a, scale=scale, zero_point=zero_point,
+                                       dtype=torch_type)
+
+        # Test the ops.quantized separately, because None is not treated.
+        a_hat = torch.ops.quantized.max_pool2d(
+            qa, kernel_size=_pair(kernel),
+            stride=_pair(kernel if stride is None else stride),
+            padding=_pair(padding), dilation=_pair(dilation), ceil_mode=ceil_mode)
+        self.assertEqual(a_ref, a_hat.dequantize(),
+                         msg="ops.quantized.max_pool2d results are off")
+
+
+class TestQuantizedMaxPool2dPT2EDevice(TestCase):
+    """The pt2e lowering of max_pool2d takes a plain uint8 tensor rather than a
+    quantized dtype, so unlike the rest of this file it is not tied to the
+    CPU-only QuantizedCPU backend. quantized::max_pool2d is registered for the
+    plain (non-quantized) key on CPU and XPU only -- CUDA has just the
+    QuantizedCUDA/cudnn variant -- hence the only_for below."""
+
+    hw_classification = HardwareClassification.GENERIC
+
+    @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
+    def test_max_pool2d_pt2e(self, device):
+        kernel_list = [2, 3]
+        stride_list = [1, 2]
+        padding_list = [0, 2]
+        dilation_list = [1, 2]
+        ceil_mode_list = [False, True]
+        channels_last_input = [False, True]
+        options = itertools.product(kernel_list, stride_list, padding_list, dilation_list, ceil_mode_list, channels_last_input)
+        for kernel, stride, padding, dilation, ceil_mode, channels_last in options:
+            if padding >= (kernel // 2):
+                # Continue with invalid input
+                continue
+            input = torch.randint(0, 8, (1, 3, 8, 8), dtype=torch.uint8, device=device)
+            if channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            a_pool = torch.nn.functional.max_pool2d(input.to(torch.float32), kernel_size=kernel,
+                                                    stride=stride, padding=padding, dilation=dilation,
+                                                    ceil_mode=ceil_mode).to(torch.uint8)
+            a_hat = torch.ops.quantized.max_pool2d(input, kernel_size=_pair(kernel),
+                                                   stride=_pair(stride), padding=_pair(padding),
+                                                   dilation=_pair(dilation), ceil_mode=ceil_mode)
+            self.assertEqual(input.is_contiguous(), a_hat.is_contiguous(),
+                             msg="ops.quantized.max_pool2d input output diff memory format")
+            self.assertEqual(a_pool, a_hat,
+                             msg="ops.quantized.max_pool2d results are off")
+
+    @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
+    def test_max_pool2d_invalid_padding(self, device):
+        input = torch.randint(0, 8, (1, 3, 8, 8), dtype=torch.uint8, device=device)
+        with self.assertRaisesRegex(RuntimeError, "padding should be smaller than half of kernel_size"):
+            torch.ops.quantized.max_pool2d(input, kernel_size=_pair(2), stride=_pair(1),
+                                           padding=_pair(2), dilation=_pair(1), ceil_mode=False)
+
+
 class TestDynamicQuantizedOps(TestCase):
     """Tests the correctness of the dynamic quantized linear and linear_relu op."""
+    hw_classification = HardwareClassification.CPU
+
     @override_qengines
     @given(
         batch_size=st.integers(1, 4),
@@ -4179,6 +4209,8 @@ class TestDynamicQuantizedOps(TestCase):
 
 
 class TestQuantizedLinear(TestCase):
+    hw_classification = HardwareClassification.CPU
+
     def _test_qlinear_impl(self, batch_size, input_channels, output_channels, use_bias,
                            post_op, use_multi_dim_input, use_channelwise, **post_op_kwargs):
         decimal_val = 4
@@ -4470,101 +4502,6 @@ class TestQuantizedLinear(TestCase):
                 Y_fp32_ref[Y_fp32_ref < 0.0] = 0.0
             decimal_val = 1
             np.testing.assert_array_almost_equal(Y_fp32_ref.numpy(), Y_q_dq.numpy(), decimal=decimal_val)
-
-    @given(batch_size=st.integers(1, 4),
-           # in cudnn v. 8.4.0, there is a limitation that input channels
-           # should be a multiple of 4 for int8 tensors. in cudnn v.8.3.3
-           # this should be a multiple of 16
-           input_channels=st.sampled_from([4, 8, 12, 16, 32]),
-           # constraints on output channels appear to be relax, as it seems we can use any positive integer here
-           # except 1. It is not clear why 1 will not work. TODO: check with Yang
-           output_channels=st.integers(2, 36),
-           use_bias=st.booleans(),
-           use_relu=st.booleans(),
-           use_multi_dim_input=st.booleans(),
-           use_channelwise=st.sampled_from([False]))  # channelwise currently not supported for qlinear cudnn
-    @skipIfNoFBGEMM
-    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
-    @unittest.skipIf(TEST_CUDNN and torch.backends.cudnn.version() == 90100, "expected failure on cuDNN 9.1.0")
-    @unittest.skipIf(not SM80OrLater, "requires sm80 or later.")
-    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
-    # TODO: check with yang regarding CUDNN flags
-    @unittest.skip("not currently working and feature isn't used")
-    def test_qlinear_cudnn(self, batch_size, input_channels, output_channels, use_bias,
-                           use_relu, use_multi_dim_input, use_channelwise):
-        qlinear_prepack = torch.ops.quantized.linear_prepack
-        if use_relu:
-            qlinear_op = torch.ops.quantized.linear_relu
-        else:
-            qlinear_op = torch.ops.quantized.linear
-        X_scale = 1.5
-        X_zp = 0
-        X_value_min = -128
-        X_value_max = 127
-        X_q0 = np.round(
-            np.random.rand(batch_size, input_channels) *
-            (X_value_max - X_value_min)
-            + X_value_min).astype(np.int8)
-        W_scale = 2.5
-        W_zp = 0
-        W_value_min = -128
-        W_value_max = 127
-        W_q0 = np.round(
-            np.random.rand(output_channels, input_channels)
-            * (W_value_max - W_value_min)
-            + W_value_min
-        ).astype(np.int8)
-        b_value_min = -10
-        b_value_max = 10
-        b_q0 = np.round(
-            np.random.rand(output_channels) *
-            (b_value_max - b_value_min) + b_value_min
-        ).astype(np.int32) if use_bias else None
-        if use_bias:
-            b_value_min = -10
-            b_value_max = 10
-            b_q0 = np.round(
-                np.random.rand(output_channels) *
-                (b_value_max - b_value_min) + b_value_min
-            ).astype(np.int32)
-        else:
-            bias = None
-        avoid_vpmaddubsw_overflow_linear(
-            batch_size,
-            input_channels,
-            output_channels,
-            X_q0,
-            X_value_min,
-            X_value_max,
-            W_q0,
-            W_value_min,
-            W_value_max,
-        )
-        quant_dtype = torch.qint8
-        X = torch.from_numpy(_dequantize(
-            X_q0, X_scale, X_zp)).to(dtype=torch.float).to(device="cuda")
-        X_q = torch.quantize_per_tensor(
-            X, scale=X_scale, zero_point=X_zp, dtype=quant_dtype)
-        W = torch.from_numpy(_dequantize(
-            W_q0, W_scale, W_zp)).to(dtype=torch.float).to(device="cuda")
-        W_q = torch.quantize_per_tensor(W, scale=W_scale, zero_point=W_zp, dtype=quant_dtype)
-        b = torch.from_numpy(_dequantize(
-            b_q0, X_scale * (W_zp), 0)).to(dtype=torch.float).to(device="cuda") if use_bias else None
-        b_q = torch.quantize_per_tensor(
-            b, scale=X_scale * W_scale, zero_point=0, dtype=quant_dtype) if use_bias else None
-        Y_scale = 0.5
-        Y_zp = 0
-        # Weight prepacking operator for quantized Linear
-        float_bias = b if use_bias else None
-        W_prepack = qlinear_prepack(W_q, float_bias if use_bias else None)
-        # Quantized Linear operator with prepacked weight
-        Y_q = qlinear_op(X_q, W_prepack, Y_scale, Y_zp).to(device="cpu")
-        Y_q_ref = qlinear_ref(X_q0, X_scale, X_zp, W_q0,
-                              W_scale, W_zp, b_q0, Y_scale, Y_zp, dtype=np.int8)
-        if use_relu:
-            Y_q_ref[Y_q_ref < Y_zp] = Y_zp
-        decimal_val = 0
-        np.testing.assert_array_almost_equal(Y_q_ref, Y_q.int_repr().numpy(), decimal=decimal_val)
 
     """Tests the correctness of the quantized::linear_unpack op."""
     @given(W=hu.tensor(shapes=hu.array_shapes(2, 2,),
@@ -5157,8 +5094,108 @@ class TestQuantizedLinear(TestCase):
         )
 
 
+class TestQuantizedLinearCUDNN(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    @given(batch_size=st.integers(1, 4),
+           # in cudnn v. 8.4.0, there is a limitation that input channels
+           # should be a multiple of 4 for int8 tensors. in cudnn v.8.3.3
+           # this should be a multiple of 16
+           input_channels=st.sampled_from([4, 8, 12, 16, 32]),
+           # constraints on output channels appear to be relax, as it seems we can use any positive integer here
+           # except 1. It is not clear why 1 will not work. TODO: check with Yang
+           output_channels=st.integers(2, 36),
+           use_bias=st.booleans(),
+           use_relu=st.booleans(),
+           use_multi_dim_input=st.booleans(),
+           use_channelwise=st.sampled_from([False]))  # channelwise currently not supported for qlinear cudnn
+    @skipIfNoFBGEMM
+    @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
+    @unittest.skipIf(TEST_CUDNN and torch.backends.cudnn.version() == 90100, "expected failure on cuDNN 9.1.0")
+    @unittest.skipIf(not SM80OrLater, "requires sm80 or later.")
+    @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
+    # TODO: check with yang regarding CUDNN flags
+    @unittest.skip("not currently working and feature isn't used")
+    def test_qlinear_cudnn(self, batch_size, input_channels, output_channels, use_bias,
+                           use_relu, use_multi_dim_input, use_channelwise):
+        qlinear_prepack = torch.ops.quantized.linear_prepack
+        if use_relu:
+            qlinear_op = torch.ops.quantized.linear_relu
+        else:
+            qlinear_op = torch.ops.quantized.linear
+        X_scale = 1.5
+        X_zp = 0
+        X_value_min = -128
+        X_value_max = 127
+        X_q0 = np.round(
+            np.random.rand(batch_size, input_channels) *
+            (X_value_max - X_value_min)
+            + X_value_min).astype(np.int8)
+        W_scale = 2.5
+        W_zp = 0
+        W_value_min = -128
+        W_value_max = 127
+        W_q0 = np.round(
+            np.random.rand(output_channels, input_channels)
+            * (W_value_max - W_value_min)
+            + W_value_min
+        ).astype(np.int8)
+        b_value_min = -10
+        b_value_max = 10
+        b_q0 = np.round(
+            np.random.rand(output_channels) *
+            (b_value_max - b_value_min) + b_value_min
+        ).astype(np.int32) if use_bias else None
+        if use_bias:
+            b_value_min = -10
+            b_value_max = 10
+            b_q0 = np.round(
+                np.random.rand(output_channels) *
+                (b_value_max - b_value_min) + b_value_min
+            ).astype(np.int32)
+        else:
+            bias = None
+        avoid_vpmaddubsw_overflow_linear(
+            batch_size,
+            input_channels,
+            output_channels,
+            X_q0,
+            X_value_min,
+            X_value_max,
+            W_q0,
+            W_value_min,
+            W_value_max,
+        )
+        quant_dtype = torch.qint8
+        X = torch.from_numpy(_dequantize(
+            X_q0, X_scale, X_zp)).to(dtype=torch.float).to(device="cuda")
+        X_q = torch.quantize_per_tensor(
+            X, scale=X_scale, zero_point=X_zp, dtype=quant_dtype)
+        W = torch.from_numpy(_dequantize(
+            W_q0, W_scale, W_zp)).to(dtype=torch.float).to(device="cuda")
+        W_q = torch.quantize_per_tensor(W, scale=W_scale, zero_point=W_zp, dtype=quant_dtype)
+        b = torch.from_numpy(_dequantize(
+            b_q0, X_scale * (W_zp), 0)).to(dtype=torch.float).to(device="cuda") if use_bias else None
+        b_q = torch.quantize_per_tensor(
+            b, scale=X_scale * W_scale, zero_point=0, dtype=quant_dtype) if use_bias else None
+        Y_scale = 0.5
+        Y_zp = 0
+        # Weight prepacking operator for quantized Linear
+        float_bias = b if use_bias else None
+        W_prepack = qlinear_prepack(W_q, float_bias if use_bias else None)
+        # Quantized Linear operator with prepacked weight
+        Y_q = qlinear_op(X_q, W_prepack, Y_scale, Y_zp).to(device="cpu")
+        Y_q_ref = qlinear_ref(X_q0, X_scale, X_zp, W_q0,
+                              W_scale, W_zp, b_q0, Y_scale, Y_zp, dtype=np.int8)
+        if use_relu:
+            Y_q_ref[Y_q_ref < Y_zp] = Y_zp
+        decimal_val = 0
+        np.testing.assert_array_almost_equal(Y_q_ref, Y_q.int_repr().numpy(), decimal=decimal_val)
+
+
 @unittest.skipIf(IS_MACOS, "Known test failure on Mac.")
 class TestQuantizedEmbeddingOps(TestCase):
+    hw_classification = HardwareClassification.CPU
 
     def _test_embedding_bag_unpack_impl(self, pack_fn, unpack_fn, bit_rate, optimized_qparams, weights):
         data_type = weights.dtype
@@ -5422,6 +5459,103 @@ class TestQuantizedEmbeddingOps(TestCase):
                                                fallback_to_no_sparse,
                                                sparsity=sparsity,
                                                atol=1.0, rtol=1e-1)
+
+    """ Tests the correctness of the quantized 8 bit embedding lookup operator """
+    @given(num_embeddings=st.integers(10, 100),
+           embedding_dim=st.integers(5, 50).filter(lambda x: x % 4 == 0))
+    def test_embedding(self, num_embeddings, embedding_dim):
+        dtypes = [torch.quint8, torch.quint4x2]
+        quant_ops = [torch.ops.quantized.embedding_byte, torch.ops.quantized.embedding_4bit]
+        atols = [0.005, 0.1]
+        rtols = [1e-3, 1e-2]
+        prepack_op = torch.ops.quantized.embedding_bag_prepack
+        for quant_op, dtype, atol, rtol in zip(quant_ops, dtypes, atols, rtols):
+            weights = torch.from_numpy((np.random.random_sample((
+                num_embeddings, embedding_dim)) + 1).astype(np.float32))
+
+            obs = PerChannelMinMaxObserver(dtype=dtype, qscheme=torch.per_channel_affine_float_qparams, ch_axis=0)
+            obs(weights)
+            # Get the scale and zero point for the weight tensor
+            qparams = obs.calculate_qparams()
+
+            # Quantize the weights to 8bits
+            qweight = torch.quantize_per_channel(weights, qparams[0], qparams[1], axis=0, dtype=dtype)
+            max_segments = 5
+            max_segment_length = 20
+            num_lengths = np.random.randint(1, max_segments + 1)
+            lengths = np.random.randint(1, max_segment_length + 1,
+                                        size=num_lengths).astype(np.int32)
+            num_indices = np.sum(lengths)
+            indices = torch.from_numpy(np.random.randint(
+                low=0, high=num_embeddings, size=num_indices, dtype=np.int64))
+
+            packed_weight = prepack_op(qweight)
+            qresult = quant_op(packed_weight, indices, pruned_weights=False)
+
+            ref = torch.embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False)
+            torch.testing.assert_close(ref, qresult, atol=atol, rtol=rtol)
+
+    def test_embedding_2d_indices(self):
+        """
+        Tests the case where 2D indices are passed into the operator
+        In this case the operator computes the correct offsets argument.
+        Output shape is dependent on the indices dimension.
+        """
+        quant_op = torch.ops.quantized.embedding_byte
+        prepack_op = torch.ops.quantized.embedding_bag_prepack
+
+        indices = torch.tensor([[9, 6, 5, 7, 8, 8, 9, 2, 8, 6, 6, 9, 1, 6, 8, 8], [3, 2, 3, 6, 3, 6, 5, 7, 0, 8, 4, 6, 5, 8, 2, 3]])
+        weights = torch.randn(10, 12, dtype=torch.float32)
+
+        ref = torch.embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False)
+        obs = PerChannelMinMaxObserver(dtype=torch.quint8, qscheme=torch.per_channel_affine_float_qparams, ch_axis=0)
+        obs(weights)
+        qparams = obs.calculate_qparams()
+
+        qweight = torch.quantize_per_channel(weights, qparams[0], qparams[1], axis=0, dtype=torch.quint8)
+        packed_weight = prepack_op(qweight)
+        qresult = quant_op(packed_weight, indices, pruned_weights=False)
+        torch.testing.assert_close(ref, qresult, atol=0.05, rtol=1e-3)
+
+    def test_embedding_bag_2d_indices(self):
+        """
+        Tests the case where 2D indices are passed into the operator
+        In this case the operator computes the correct offsets argument.
+        """
+        indices = torch.tensor([[9, 6, 5, 7, 8, 8, 9, 2, 8, 6, 6, 9, 1, 6, 8, 8], [3, 2, 3, 6, 3, 6, 5, 7, 0, 8, 4, 6, 5, 8, 2, 3]])
+        weights = torch.randn(10, 12, dtype=torch.float32)
+
+        embedding_bag = torch.nn.EmbeddingBag(
+            num_embeddings=10,
+            embedding_dim=12,
+            include_last_offset=False, _weight=weights,
+            scale_grad_by_freq=False, mode='sum'
+        )
+        result = embedding_bag(indices)
+
+        pt_op = torch.ops.quantized.embedding_bag_byte_rowwise_offsets
+        pt_prepack_op = torch.ops.quantized.embedding_bag_byte_prepack
+        q_weights = pt_prepack_op(weights)
+        qresult = pt_op(q_weights, indices, mode=0, pruned_weights=False)
+        torch.testing.assert_close(result, qresult, atol=0.05, rtol=1e-3)
+
+        # Test TorchBind based embedding_bag operator
+        obs = PerChannelMinMaxObserver(dtype=torch.quint8, qscheme=torch.per_channel_affine_float_qparams, ch_axis=0)
+        obs(weights)
+        # Get the scale and zero point for the weight tensor
+        qparams = obs.calculate_qparams()
+
+        # Quantize the weights to 8bits
+        qweight = torch.quantize_per_channel(weights, qparams[0], qparams[1], axis=0, dtype=torch.quint8)
+
+        packed_weight = torch.ops.quantized.embedding_bag_prepack(qweight)
+        qresult = torch.ops.quantized.embedding_bag_byte(packed_weight, indices, mode=0)
+
+        torch.testing.assert_close(result, qresult, atol=0.05, rtol=1e-3)
+
+
+class TestQuantizedEmbeddingOpsCUDA(TestCase):
+    hw_classification = HardwareClassification.CUDA
 
     """ Tests that the CUDA quantized embedding_bag operators agree with their
         CPU counterparts. This covers the bit-field extraction the dequantization
@@ -5772,101 +5906,13 @@ class TestQuantizedEmbeddingOps(TestCase):
                 compressed_indices_mapping=mapping.cuda(),
                 include_last_offset=False)
 
-    """ Tests the correctness of the quantized 8 bit embedding lookup operator """
-    @given(num_embeddings=st.integers(10, 100),
-           embedding_dim=st.integers(5, 50).filter(lambda x: x % 4 == 0))
-    def test_embedding(self, num_embeddings, embedding_dim):
-        dtypes = [torch.quint8, torch.quint4x2]
-        quant_ops = [torch.ops.quantized.embedding_byte, torch.ops.quantized.embedding_4bit]
-        atols = [0.005, 0.1]
-        rtols = [1e-3, 1e-2]
-        prepack_op = torch.ops.quantized.embedding_bag_prepack
-        for quant_op, dtype, atol, rtol in zip(quant_ops, dtypes, atols, rtols):
-            weights = torch.from_numpy((np.random.random_sample((
-                num_embeddings, embedding_dim)) + 1).astype(np.float32))
-
-            obs = PerChannelMinMaxObserver(dtype=dtype, qscheme=torch.per_channel_affine_float_qparams, ch_axis=0)
-            obs(weights)
-            # Get the scale and zero point for the weight tensor
-            qparams = obs.calculate_qparams()
-
-            # Quantize the weights to 8bits
-            qweight = torch.quantize_per_channel(weights, qparams[0], qparams[1], axis=0, dtype=dtype)
-            max_segments = 5
-            max_segment_length = 20
-            num_lengths = np.random.randint(1, max_segments + 1)
-            lengths = np.random.randint(1, max_segment_length + 1,
-                                        size=num_lengths).astype(np.int32)
-            num_indices = np.sum(lengths)
-            indices = torch.from_numpy(np.random.randint(
-                low=0, high=num_embeddings, size=num_indices, dtype=np.int64))
-
-            packed_weight = prepack_op(qweight)
-            qresult = quant_op(packed_weight, indices, pruned_weights=False)
-
-            ref = torch.embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False)
-            torch.testing.assert_close(ref, qresult, atol=atol, rtol=rtol)
-
-    def test_embedding_2d_indices(self):
-        """
-        Tests the case where 2D indices are passed into the operator
-        In this case the operator computes the correct offsets argument.
-        Output shape is dependent on the indices dimension.
-        """
-        quant_op = torch.ops.quantized.embedding_byte
-        prepack_op = torch.ops.quantized.embedding_bag_prepack
-
-        indices = torch.tensor([[9, 6, 5, 7, 8, 8, 9, 2, 8, 6, 6, 9, 1, 6, 8, 8], [3, 2, 3, 6, 3, 6, 5, 7, 0, 8, 4, 6, 5, 8, 2, 3]])
-        weights = torch.randn(10, 12, dtype=torch.float32)
-
-        ref = torch.embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False)
-        obs = PerChannelMinMaxObserver(dtype=torch.quint8, qscheme=torch.per_channel_affine_float_qparams, ch_axis=0)
-        obs(weights)
-        qparams = obs.calculate_qparams()
-
-        qweight = torch.quantize_per_channel(weights, qparams[0], qparams[1], axis=0, dtype=torch.quint8)
-        packed_weight = prepack_op(qweight)
-        qresult = quant_op(packed_weight, indices, pruned_weights=False)
-        torch.testing.assert_close(ref, qresult, atol=0.05, rtol=1e-3)
-
-    def test_embedding_bag_2d_indices(self):
-        """
-        Tests the case where 2D indices are passed into the operator
-        In this case the operator computes the correct offsets argument.
-        """
-        indices = torch.tensor([[9, 6, 5, 7, 8, 8, 9, 2, 8, 6, 6, 9, 1, 6, 8, 8], [3, 2, 3, 6, 3, 6, 5, 7, 0, 8, 4, 6, 5, 8, 2, 3]])
-        weights = torch.randn(10, 12, dtype=torch.float32)
-
-        embedding_bag = torch.nn.EmbeddingBag(
-            num_embeddings=10,
-            embedding_dim=12,
-            include_last_offset=False, _weight=weights,
-            scale_grad_by_freq=False, mode='sum'
-        )
-        result = embedding_bag(indices)
-
-        pt_op = torch.ops.quantized.embedding_bag_byte_rowwise_offsets
-        pt_prepack_op = torch.ops.quantized.embedding_bag_byte_prepack
-        q_weights = pt_prepack_op(weights)
-        qresult = pt_op(q_weights, indices, mode=0, pruned_weights=False)
-        torch.testing.assert_close(result, qresult, atol=0.05, rtol=1e-3)
-
-        # Test TorchBind based embedding_bag operator
-        obs = PerChannelMinMaxObserver(dtype=torch.quint8, qscheme=torch.per_channel_affine_float_qparams, ch_axis=0)
-        obs(weights)
-        # Get the scale and zero point for the weight tensor
-        qparams = obs.calculate_qparams()
-
-        # Quantize the weights to 8bits
-        qweight = torch.quantize_per_channel(weights, qparams[0], qparams[1], axis=0, dtype=torch.quint8)
-
-        packed_weight = torch.ops.quantized.embedding_bag_prepack(qweight)
-        qresult = torch.ops.quantized.embedding_bag_byte(packed_weight, indices, mode=0)
-
-        torch.testing.assert_close(result, qresult, atol=0.05, rtol=1e-3)
-
 
 class TestQuantizedConv(TestCase):
+    # Tagged CPU even though four *_cudnn tests live here: they all go through
+    # _test_qconv_impl, which 11 CPU tests also use, so splitting them out into a
+    # CUDA-tagged class would mean relocating that helper.
+    hw_classification = HardwareClassification.CPU
+
     def _test_qconv_unpack_impl(self, qconv_prepack_fn, qconv_unpack_fn, inputs,
                                 strides, i_pads, o_pads, channelwise):
         (X_data, W_data, bias_data, groups, transposed) = inputs
@@ -8937,6 +8983,8 @@ class TestQuantizedConv(TestCase):
 
 
 class TestPadding(TestCase):
+    hw_classification = HardwareClassification.CPU
+
     @given(batch_size=st.integers(1, 64),
            channels=st.integers(1, 64),
            width=st.integers(16, 128),
@@ -9024,6 +9072,8 @@ class TestPadding(TestCase):
                      "This Pytorch Build has not been built with or does not support QNNPACK")
 class TestQNNPackOps(TestCase):
     """Tests the correctness of the quantized::qnnpack_relu op."""
+    hw_classification = HardwareClassification.CPU
+
     @given(X=hu.tensor(shapes=hu.array_shapes(1, 5, 1, 5),
                        qparams=hu.qparams(dtypes=torch.quint8,
                                           zero_point_min=0,
@@ -9502,6 +9552,8 @@ class TestQNNPackOps(TestCase):
 """Tests the correctness of the tensor comparators."""
 class TestComparatorOps(TestCase):
     """Tests the element-wise equality ops."""
+    hw_classification = HardwareClassification.CPU
+
     @given(A=hu.tensor(shapes=((3, 4, 5),),
                        qparams=hu.qparams()),
            B=hu.tensor(shapes=((5,), (1, 5), (1, 1, 5), (4, 5), (3, 4, 5)),
@@ -9574,6 +9626,8 @@ class TestComparatorOps(TestCase):
 """Tests the correctness of the quantized::embedding_bag_(byte|4bit|2bit)_prepack_with_rowwise_min_max ops."""
 class TestQuantizedWithMinMax(TestCase):
     """Validates that the *rowwsie_min_max* quantization functions are equivalent to the ones without it."""
+    hw_classification = HardwareClassification.CPU
+
     def test_quantize_tensor_with_min_max(self):
         num_rows_list = [1, 2, 10, 100]
         num_cols_list = [4, 8, 16, 32, 64, 128]
@@ -9647,6 +9701,11 @@ class TestQuantizedWithMinMax(TestCase):
                             "weight_incorrectly_quantized should not equal "
                             "weight_quantized_no_rowwise_min_max"
                         )
+
+
+instantiate_device_type_tests(
+    TestQuantizedMaxPool2dPT2EDevice, globals(), only_for=("cpu", "xpu"), allow_xpu=True
+)
 
 if __name__ == "__main__":
     raise_on_run_directly("test/test_quantization.py")
